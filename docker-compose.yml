@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: dabkrs-feedback-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - DB_PATH=/app/data/bot.db
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data:

@@ -8,6 +8,7 @@ import (
 
 	"dabkrsbot/internal/config"
 	"dabkrsbot/internal/handler"
+	"dabkrsbot/internal/storage"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -24,6 +25,14 @@ func main() {
 		log.Fatal("TG_KEY не установлен в переменных окружения или .env файле")
 	}
 
+	// Инициализация SQLite
+	store, err := storage.New(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("Ошибка инициализации БД: %v", err)
+	}
+	defer store.Close()
+	log.Printf("БД подключена: %s", cfg.DBPath)
+
 	bot, err := tgbotapi.NewBotAPI(cfg.TGKey)
 	if err != nil {
 		log.Fatalf("Ошибка инициализации бота: %v", err)
@@ -36,10 +45,9 @@ func main() {
 		log.Println("ВНИМАНИЕ: ADMIN_ID не задан — пересылка работать не будет")
 	}
 
-	// Отключаем debug в продакшене
 	bot.Debug = false
 
-	h := handler.New(bot, cfg.AdminID)
+	h := handler.New(bot, cfg.AdminID, store)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -54,6 +62,7 @@ func main() {
 		<-sigChan
 		log.Println("Получен сигнал завершения, останавливаем бота...")
 		bot.StopReceivingUpdates()
+		store.Close()
 	}()
 
 	for update := range updates {

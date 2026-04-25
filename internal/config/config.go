@@ -10,6 +10,7 @@ import (
 type Config struct {
 	TGKey   string
 	AdminID int64
+	DBPath  string
 }
 
 func Load() (*Config, error) {
@@ -28,6 +29,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		TGKey:   getEnv("TG_KEY", ""),
 		AdminID: adminID,
+		DBPath:  getEnv("DB_PATH", "data/bot.db"),
 	}
 
 	return cfg, nil

@@ -7,20 +7,19 @@ import (
 	"time"
 
 	"dabkrsbot/internal/ratelimit"
+	"dabkrsbot/internal/storage"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// Handler обрабатывает сообщения бота.
 type Handler struct {
 	bot       *tgbotapi.BotAPI
 	adminID   int64
 	rl        *ratelimit.RateLimiter
-	blocklist *ratelimit.Blocklist
+	store     *storage.Storage
 	stats     *Stats
 }
 
-// Stats — простая статистика.
 type Stats struct {
 	totalMessages int
 	blockedCount  int
@@ -28,12 +27,12 @@ type Stats struct {
 	startedAt     time.Time
 }
 
-func New(bot *tgbotapi.BotAPI, adminID int64) *Handler {
+func New(bot *tgbotapi.BotAPI, adminID int64, store *storage.Storage) *Handler {
 	return &Handler{
 		bot:       bot,
 		adminID:   adminID,
-		rl:        ratelimit.New(3, time.Hour), // 3 сообщения в час
-		blocklist: ratelimit.NewBlocklist(),
+		rl:        ratelimit.New(3, time.Hour),
+		store:     store,
 		stats: &Stats{
 			startedAt: time.Now(),
 		},
@@ -51,20 +50,31 @@ func (h *Handler) Handle(update tgbotapi.Update) {
 	user := msg.From
 	log.Printf("[%s] %s (ID: %d): %s", user.UserName, user.FirstName, user.ID, msg.Text)
 
-	// Если сообщение от админа — обрабатываем команды
+	// Если сообщение от админа — команды
 	if user.ID == h.adminID {
 		h.handleAdminCommand(msg)
 		return
 	}
 
-	// Проверка: заблокирован ли пользователь
-	if h.blocklist.IsBlocked(user.ID) {
-		h.stats.blockedCount++
-		log.Printf("Заблокированный пользователь %d попытался отправить сообщение", user.ID)
-		return // игнорируем, даже не отвечаем
+	// Команды пользователя (не тратят лимит)
+	if strings.HasPrefix(msg.Text, "/") {
+		if h.handleUserCommand(msg) {
+			return
+		}
 	}
 
-	// Проверка rate limit
+	// Проверка блокировки через БД
+	blocked, err := h.store.IsBlocked(user.ID)
+	if err != nil {
+		log.Printf("Ошибка проверки блокировки: %v", err)
+	}
+	if blocked {
+		h.stats.blockedCount++
+		log.Printf("Заблокированный пользователь %d попытался отправить сообщение", user.ID)
+		return
+	}
+
+	// Rate limit
 	remaining := h.rl.Remaining(user.ID)
 	if !h.rl.Allow(user.ID) {
 		h.stats.blockedCount++
@@ -75,7 +85,12 @@ func (h *Handler) Handle(update tgbotapi.Update) {
 		return
 	}
 
-	// Пересылаем сообщение админу
+	// Сохраняем в БД
+	if err := h.store.SaveFeedback(user.ID, user.UserName, user.FirstName, msg.Text); err != nil {
+		log.Printf("Ошибка сохранения отзыва: %v", err)
+	}
+
+	// Пересылаем админу
 	h.forwardToAdmin(msg, remaining-1)
 	// Подтверждаем пользователю
 	h.confirmUser(msg.Chat.ID, remaining-1)
@@ -99,6 +114,36 @@ func (h *Handler) confirmUser(chatID int64, remaining int) {
 	h.reply(chatID, text)
 }
 
+func (h *Handler) handleUserCommand(msg *tgbotapi.Message) bool {
+	cmd := strings.Fields(msg.Text)[0]
+
+	switch cmd {
+	case "/start":
+		h.reply(msg.Chat.ID,
+			"👋 <b>Добро пожаловать!</b>\n\n"+
+				"Это бот обратной связи для сервиса перевода с китайского на русский.\n\n"+
+				"Если вы нашли ошибку в переводе, заметили неточность или хотите "+
+				"предложить улучшение — просто напишите сообщение, и я передам его разработчику.\n\n"+
+				"📌 <b>Лимит:</b> 3 сообщения в час",
+		)
+		return true
+
+	case "/info":
+		h.reply(msg.Chat.ID,
+			"ℹ️ <b>О сервисе</b>\n\n"+
+				"Сервис перевода слов с китайского языка на русский.\n\n"+
+				"Нашли ошибку? Напишите её текстом — мы всё поправим.\n\n"+
+				"💬 Команды:\n"+
+				"<code>/start</code> — приветствие\n"+
+				"<code>/info</code> — информация о боте",
+		)
+		return true
+
+	default:
+		return false
+	}
+}
+
 func (h *Handler) forwardToAdmin(msg *tgbotapi.Message, remaining int) {
 	if h.adminID == 0 {
 		log.Println("ADMIN_ID не задан, пересылка невозможна")
@@ -112,12 +157,9 @@ func (h *Handler) forwardToAdmin(msg *tgbotapi.Message, remaining int) {
 		text += fmt.Sprintf("🔗 @%s\n", user.UserName)
 	}
 	text += fmt.Sprintf("🆔 ID: <code>%d</code>\n", user.ID)
-
-	// Язык пользователя (если Telegram предоставил)
 	if user.LanguageCode != "" {
 		text += fmt.Sprintf("🌐 Язык: %s\n", user.LanguageCode)
 	}
-
 	text += fmt.Sprintf("\n📊 Осталось сообщений у пользователя: %d", remaining)
 
 	rmsg := tgbotapi.NewMessage(h.adminID, text)
@@ -150,18 +192,32 @@ func (h *Handler) handleAdminCommand(msg *tgbotapi.Message) {
 		)
 
 	case "/stats":
+		// Статистика из БД + сессионная
+		dbStats, err := h.store.GetStats()
+		if err != nil {
+			log.Printf("Ошибка получения статистики из БД: %v", err)
+			h.reply(msg.Chat.ID, "Ошибка получения статистики")
+			return
+		}
+
 		h.reply(msg.Chat.ID, fmt.Sprintf(
 			"📊 <b>Статистика бота</b>\n\n"+
-				"Всего сообщений: %d\n"+
-				"Переслано админу: %d\n"+
-				"Заблокировано (спам): %d\n"+
-				"Заблокировано (вручную): %d\n"+
-				"Работает с: %s",
+				"<u>За всё время (БД):</u>\n"+
+				"Всего отзывов: %d\n"+
+				"Переслано: %d\n"+
+				"Заблокировано пользователей: %d\n"+
+				"Сбор с: %s\n\n"+
+				"<u>С текущего запуска:</u>\n"+
+				"Сообщений получено: %d\n"+
+				"Отклонено (спам): %d\n"+
+				"Переслано: %d\n",
+			dbStats.TotalFeedbacks,
+			dbStats.Forwarded,
+			dbStats.BlockedUsers,
+			dbStats.Since.Format("2006-01-02 15:04"),
 			h.stats.totalMessages,
-			h.stats.forwardedCount,
 			h.stats.blockedCount,
-			len(h.blocklist.All()),
-			h.stats.startedAt.Format("2006-01-02 15:04"),
+			h.stats.forwardedCount,
 		))
 
 	case "/block":
@@ -178,7 +234,11 @@ func (h *Handler) handleAdminCommand(msg *tgbotapi.Message) {
 		if len(parts) > 2 {
 			reason = strings.Join(parts[2:], " ")
 		}
-		h.blocklist.Block(userID, reason)
+		if err := h.store.BlockUser(userID, reason); err != nil {
+			log.Printf("Ошибка блокировки: %v", err)
+			h.reply(msg.Chat.ID, "Ошибка при блокировке")
+			return
+		}
 		h.reply(msg.Chat.ID, fmt.Sprintf("🚫 Пользователь <code>%d</code> заблокирован.", userID))
 
 	case "/unblock":
@@ -191,11 +251,20 @@ func (h *Handler) handleAdminCommand(msg *tgbotapi.Message) {
 			h.reply(msg.Chat.ID, "Некорректный ID")
 			return
 		}
-		h.blocklist.Unblock(userID)
+		if err := h.store.UnblockUser(userID); err != nil {
+			log.Printf("Ошибка разблокировки: %v", err)
+			h.reply(msg.Chat.ID, "Ошибка при разблокировке")
+			return
+		}
 		h.reply(msg.Chat.ID, fmt.Sprintf("✅ Пользователь <code>%d</code> разблокирован.", userID))
 
 	case "/blocklist":
-		users := h.blocklist.All()
+		users, err := h.store.GetAllBlocked()
+		if err != nil {
+			log.Printf("Ошибка получения блокировок: %v", err)
+			h.reply(msg.Chat.ID, "Ошибка получения списка")
+			return
+		}
 		if len(users) == 0 {
 			h.reply(msg.Chat.ID, "📋 Список заблокированных пуст.")
 			return
@@ -212,7 +281,6 @@ func (h *Handler) handleAdminCommand(msg *tgbotapi.Message) {
 		h.reply(msg.Chat.ID, sb.String())
 
 	default:
-		// Если админ просто написал текст — не пересылаем
 		h.reply(msg.Chat.ID, "Неизвестная команда. Используй /start для списка команд.")
 	}
 }
