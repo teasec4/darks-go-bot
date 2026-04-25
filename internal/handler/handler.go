@@ -13,11 +13,12 @@ import (
 )
 
 type Handler struct {
-	bot       *tgbotapi.BotAPI
-	adminID   int64
-	rl        *ratelimit.RateLimiter
-	store     *storage.Storage
-	stats     *Stats
+	bot         *tgbotapi.BotAPI
+	adminID     int64
+	rl          *ratelimit.RateLimiter
+	store       *storage.Storage
+	stopCleanup chan struct{}
+	stats       *Stats
 }
 
 type Stats struct {
@@ -28,11 +29,18 @@ type Stats struct {
 }
 
 func New(bot *tgbotapi.BotAPI, adminID int64, store *storage.Storage) *Handler {
+	rl := ratelimit.New(3, time.Hour)
+
+	// Фоновая чистка старых записей rate limiter — раз в 15 минут
+	stopCleanup := make(chan struct{})
+	rl.StartCleanup(15*time.Minute, stopCleanup)
+
 	return &Handler{
-		bot:       bot,
-		adminID:   adminID,
-		rl:        ratelimit.New(3, time.Hour),
-		store:     store,
+		bot:         bot,
+		adminID:     adminID,
+		rl:          rl,
+		store:       store,
+		stopCleanup: stopCleanup,
 		stats: &Stats{
 			startedAt: time.Now(),
 		},

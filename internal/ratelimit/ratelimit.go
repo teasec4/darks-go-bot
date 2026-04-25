@@ -71,3 +71,34 @@ func (rl *RateLimiter) Remaining(userID int64) int {
 func (rl *RateLimiter) ResetInterval() time.Duration {
 	return rl.interval
 }
+
+// cleanup удаляет записи, у которых окно истекло.
+func (rl *RateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	for id, e := range rl.users {
+		if now.Sub(e.windowAt) > rl.interval {
+			delete(rl.users, id)
+		}
+	}
+}
+
+// StartCleanup запускает фоновую горутину для очистки старых записей.
+// Останавливается через переданный канал.
+func (rl *RateLimiter) StartCleanup(interval time.Duration, stop <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				rl.cleanup()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
